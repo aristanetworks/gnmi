@@ -20,42 +20,105 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
-	
-	log "github.com/golang/glog"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc"
-	"github.com/openconfig/grpctunnel/tunnel"
 	"github.com/golang/protobuf/proto"
 	"github.com/openconfig/gnmi/cache"
 	"github.com/openconfig/gnmi/client"
 	gnmiclient "github.com/openconfig/gnmi/client/gnmi"
 	coll "github.com/openconfig/gnmi/collector"
-	"github.com/openconfig/gnmi/subscribe"
-	"github.com/openconfig/gnmi/target"
-
-	tunnelpb "github.com/openconfig/grpctunnel/proto/tunnel"
 	cpb "github.com/openconfig/gnmi/proto/collector"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	tpb "github.com/openconfig/gnmi/proto/target"
+	"github.com/openconfig/gnmi/subscribe"
+	"github.com/openconfig/gnmi/target"
+	tunnelpb "github.com/openconfig/grpctunnel/proto/tunnel"
+	"github.com/openconfig/grpctunnel/tunnel"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 var (
-	configFile           = flag.String("config_file", "", "File path for collector configuration.")
-	certFile             = flag.String("cert_file", "", "File path for TLS certificate.")
-	keyFile              = flag.String("key_file", "", "File path for TLS key.")
-	port                 = flag.Int("port", 0, "server port")
-	dialTimeout          = flag.Duration("dial_timeout", time.Minute, "Timeout for dialing a connection to a target.")
-	metadataUpdatePeriod = flag.Duration("metadata_update_period", 0, "Period for target metadata update. 0 disables updates.")
-	sizeUpdatePeriod     = flag.Duration("size_update_period", 0, "Period for updating the target size in metadata. 0 disables updates.")
+	tunnelCert = flag.String("tunnel_cert", "", "Tunnel certificate file.")
+	tunnelKey  = flag.String("tunnel_key", "", "Tunnel private key file.")
+	tunnelCA   = flag.String("tunnel_ca", "", "Tunnel CA certificate file.")
+
+	targetName   = flag.String("target", "", "Name of the gNMI target.")
+	gnmiCert     = flag.String("gnmi_cert", "", "gNMI certificate file.")
+	gnmiKey      = flag.String("gnmi_key", "", "gNMI private key file.")
+	gnmiCA       = flag.String("gnmi_ca", "", "gNMI CA certificate file.")
+	gnmiInsecure = flag.Bool("gnmi_insecure", false, "Skip TLS validation for gNMI connection.")
+
+	username = flag.String("username", "", "Username to authenticate with.")
+	password = flag.String("password", "", "Password to authenticate with.")
+
+	configFile  = flag.String("config_file", "", "File path for collector configuration.")
+	port        = flag.Int("port", 0, "server port")
+	dialTimeout = flag.Duration("dial_timeout", time.Minute,
+		"Timeout for dialing a connection to a target.")
+	metadataUpdatePeriod = flag.Duration("metadata_update_period", 0,
+		"Period for target metadata update. 0 disables updates.")
+	sizeUpdatePeriod = flag.Duration("size_update_period", 0,
+		"Period for updating the target size in metadata. 0 disables updates.")
+	// non-tunnel request will be contained in the config file.
+	tunnelRequest = flag.String("tunnel_request", "", "request to be performed via tunnel")
 )
+
+func loadCertificates(cert, key, ca string) ([]tls.Certificate, *x509.CertPool) {
+	var certificates []tls.Certificate
+	var certPool *x509.CertPool
+	certificate, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	certificates = []tls.Certificate{certificate}
+	if ca != "" {
+		b, err := ioutil.ReadFile(ca)
+		if err != nil {
+			log.Fatal(err)
+		}
+		certPool = x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(b) {
+			log.Fatal(err)
+		}
+	}
+	return certificates, certPool
+}
+
+func getServerCredentials() grpc.ServerOption {
+	certificates, certPool := loadCertificates(*tunnelCert, *tunnelKey, *tunnelCA)
+	clientAuth := tls.RequireAndVerifyClientCert
+	if certPool == nil {
+		clientAuth = tls.NoClientCert
+	}
+	return grpc.Creds(credentials.NewTLS(&tls.Config{
+		ClientAuth:   clientAuth,
+		Certificates: certificates,
+		ClientCAs:    certPool,
+	}))
+}
+
+func getClientTLS() *tls.Config {
+	tlsConfig := &tls.Config{}
+	if *gnmiInsecure {
+		tlsConfig.InsecureSkipVerify = true
+	} else {
+		certificates, certPool := loadCertificates(*gnmiCert, *gnmiKey, *gnmiCA)
+		tlsConfig.ServerName = *targetName
+		tlsConfig.Certificates = certificates
+		tlsConfig.RootCAs = certPool
+	}
+	return tlsConfig
+}
 
 func periodic(period time.Duration, fn func()) {
 	if period == 0 {
@@ -103,16 +166,26 @@ func runCollector(ctx context.Context) error {
 	if *configFile == "" {
 		return errors.New("config_file must be specified")
 	}
-	if *certFile == "" {
-		return errors.New("cert_file must be specified")
+	if (*tunnelCert != "" && *tunnelKey == "") || (*tunnelCert == "" && *tunnelKey != "") {
+		log.Fatal("tunnel_cert and tunnel_key must be specified")
 	}
-	if *keyFile == "" {
-		return errors.New("key_file must be specified")
+	if (*gnmiCert != "" && *gnmiKey == "") || (*gnmiCert == "" && *gnmiKey != "") {
+		log.Fatal("gnmi_cert and gnmi_key must be specified")
+	}
+	if *tunnelCert == "" && *tunnelCA != "" {
+		log.Fatal("tunnel_ca must be specified with tunnel_cert and tunnel_key")
+	}
+	if *gnmiCert == "" && *gnmiCA != "" {
+		log.Fatal("gnmi_ca must be specified with gnmi_cert and gnmi_key")
+	}
+	if *gnmiCert != "" && *targetName == "" {
+		log.Fatal("target must be specified with gnmi_cert and gnmi_key")
 	}
 
 	c := collector{config: &tpb.Configuration{},
 		cancelFuncs:    map[string]func(){},
 		tActive:        map[string]*tunnTarget{},
+		tRequest:       *tunnelRequest,
 		chDeleteTarget: make(chan tunnel.Target, 1),
 		chAddTarget:    make(chan tunnel.Target, 1),
 		addr:           fmt.Sprintf("localhost:%d", *port)}
@@ -130,16 +203,17 @@ func runCollector(ctx context.Context) error {
 	}
 
 	// Initialize TLS credentials.
-	creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
-	if err != nil {
-		return fmt.Errorf("Failed to generate credentials %v", err)
+	var serverOptions []grpc.ServerOption
+	if *tunnelCert != "" {
+		serverOptions = append(serverOptions, getServerCredentials())
 	}
 
 	// Create a grpc Server.
-	srv := grpc.NewServer(grpc.Creds(creds))
+	srv := grpc.NewServer(serverOptions...)
 
 	// Initialize tunnel server.
-	c.tServer, err = tunnel.NewServer(tunnel.ServerConfig{AddTargetHandler: c.addTargetHandler, DeleteTargetHandler: c.deleteTargetHandler})
+	c.tServer, err = tunnel.NewServer(tunnel.ServerConfig{
+		AddTargetHandler: c.addTargetHandler, DeleteTargetHandler: c.deleteTargetHandler})
 	if err != nil {
 		log.Fatalf("failed to setup tunnel server: %v", err)
 	}
@@ -170,7 +244,11 @@ func runCollector(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
-	go srv.Serve(lis)
+	go func() {
+		if err := srv.Serve(lis); err != nil {
+			log.Printf("gNMI server error: %v", err)
+		}
+	}()
 	defer srv.Stop()
 	<-ctx.Done()
 	return ctx.Err()
@@ -214,7 +292,8 @@ func (s *state) handleUpdate(msg proto.Message) error {
 		if v.Update.Prefix.Target == "" {
 			v.Update.Prefix.Target = s.name
 		}
-		s.target.GnmiUpdate(v.Update)
+		_ = s.target.GnmiUpdate(v.Update)
+		log.Print(v)
 	case *gnmipb.SubscribeResponse_SyncResponse:
 		s.target.Sync()
 	case *gnmipb.SubscribeResponse_Error:
@@ -267,7 +346,7 @@ func (c *collector) runSingleTarget(ctx context.Context, targetID string, tc *tu
 	target, ok := c.tActive[targetID]
 	c.mu.Unlock()
 	if !ok {
-		log.Errorf("Unknown tunnel target %q", targetID)
+		log.Printf("Unknown tunnel target %q", targetID)
 		return
 	}
 
@@ -276,22 +355,26 @@ func (c *collector) runSingleTarget(ctx context.Context, targetID string, tc *tu
 		qr := c.config.Request[target.conf.GetRequest()]
 		q, err := client.NewQuery(qr)
 		if err != nil {
-			log.Errorf("NewQuery(%s): %v", qr.String(), err)
+			log.Printf("NewQuery(%s): %v", qr.String(), err)
 			return
 		}
 		q.Addrs = target.conf.GetAddresses()
 
+		user := *username
+		pass := *password
 		if target.conf.Credentials != nil {
+			user = target.conf.Credentials.Username
+			pass = target.conf.Credentials.Password
+		}
+		if user != "" {
 			q.Credentials = &client.Credentials{
-				Username: target.conf.Credentials.Username,
-				Password: target.conf.Credentials.Password,
+				Username: user,
+				Password: pass,
 			}
 		}
 
-		// TLS is always enabled for a target.
-		q.TLS = &tls.Config{
-			// Today, we assume that we should not verify the certificate from the target.
-			InsecureSkipVerify: true,
+		if *gnmiInsecure || *gnmiCert != "" {
+			q.TLS = getClientTLS()
 		}
 
 		q.Target = name
@@ -299,7 +382,7 @@ func (c *collector) runSingleTarget(ctx context.Context, targetID string, tc *tu
 		q.ProtoHandler = s.handleUpdate
 		q.TunnelConn = target.conn
 		if err := q.Validate(); err != nil {
-			log.Errorf("query.Validate(): %v", err)
+			log.Printf("query.Validate(): %v", err)
 			return
 		}
 
@@ -310,44 +393,39 @@ func (c *collector) runSingleTarget(ctx context.Context, targetID string, tc *tu
 		}
 		cl := client.BaseClient{}
 		if err := cl.Subscribe(ctx, q, gnmiclient.Type); err != nil {
-			log.Errorf("Subscribe failed for target %q: %v", name, err)
+			log.Printf("Subscribe failed for target %q: %v", name, err)
 			// remove target once it becomes unavailable
-			c.removeTarget(name)
+			if err := c.removeTarget(name); err != nil {
+				log.Printf("removeTarget %q error : %v", name, err)
+			}
 		}
 	}(targetID, target)
 }
 
 func (c *collector) start(ctx context.Context) {
 	// First, run for non-tunnel targets.
-	useTunnel := false
-	for id, t := range c.config.Target {
-		if t.GetDialer() == "tunnel" {
-			useTunnel = true
-			continue
-		}
-		log.Infof("adding non-tunnel target %s", id)
-		c.addTarget(ctx, id, &tunnTarget{conf: t})
+	for id := range c.config.Target {
 		c.runSingleTarget(ctx, id, nil)
 	}
 
-	// If no tunnels are configured then return.
-	if !useTunnel {
-		return
+	if c.tRequest == "" {
+		log.Printf("tunnel request is not specified")
 	}
-
 	// Monitor targets from the tunnel.
 	go func() {
-		log.Info("watching for tunnel connections")
+		log.Printf("watching for tunnel connections")
 		for {
 			select {
 			case target := <-c.chAddTarget:
-				log.Infof("adding target: %+v", target)
+				log.Printf("adding target: %+v", target)
 				if target.Type != tunnelpb.TargetType_GNMI_GNOI.String() {
-					log.Infof("received unsupported type type: %s from target: %s, skipping", target.Type, target.ID)
+					log.Printf("received unsupported type type: %s from target: %s, skipping",
+						target.Type, target.ID)
 					continue
 				}
 				if c.isTargetActive(target.ID) {
-					log.Infof("received target %s, which is already registered. skipping", target.ID)
+					log.Printf("received target %s, which is already registered. skipping",
+						target.ID)
 					continue
 				}
 
@@ -356,7 +434,7 @@ func (c *collector) start(ctx context.Context) {
 
 				tc, err := tunnel.ServerConn(ctx, c.tServer, c.addr, &target)
 				if err != nil {
-					log.Errorf("failed to get new tunnel session for target %v:%v", target.ID, err)
+					log.Printf("failed to get new tunnel session for target %v:%v", target.ID, err)
 					continue
 				}
 				cfg := c.config.Target[target.ID]
@@ -369,20 +447,25 @@ func (c *collector) start(ctx context.Context) {
 					conn: tc,
 					conf: cfg,
 				}
-				c.addTarget(ctx, target.ID, t)
+				if err := c.addTarget(ctx, target.ID, t); err != nil {
+					log.Printf("failed to add target %s: %s", target.ID, err)
+				}
 				c.runSingleTarget(ctx, target.ID, tc)
 
 			case target := <-c.chDeleteTarget:
-				log.Infof("deleting target: %+v", target)
+				log.Printf("deleting target: %+v", target)
 				if target.Type != tunnelpb.TargetType_GNMI_GNOI.String() {
-					log.Infof("received unsupported type type: %s from target: %s, skipping", target.Type, target.ID)
+					log.Printf("received unsupported type type: %s from target: %s, skipping",
+						target.Type, target.ID)
 					continue
 				}
 				if !c.isTargetActive(target.ID) {
-					log.Infof("received target %s, which is not registered. skipping", target.ID)
+					log.Printf("received target %s, which is not registered. skipping", target.ID)
 					continue
 				}
-				c.removeTarget(target.ID)
+				if err := c.removeTarget(target.ID); err != nil {
+					log.Printf("failed to remove target %s: %s", target.ID, err)
+				}
 			}
 		}
 	}()
@@ -393,7 +476,7 @@ func (c *collector) removeTarget(target string) error {
 	defer c.mu.Unlock()
 	t, ok := c.tActive[target]
 	if !ok {
-		log.Infof("trying to remove target %s, but not found in config. do nothing", target)
+		log.Printf("trying to remove target %s, but not found in config. do nothing", target)
 		return nil
 	}
 	delete(c.tActive, target)
@@ -404,7 +487,7 @@ func (c *collector) removeTarget(target string) error {
 	cancel()
 	delete(c.cancelFuncs, target)
 	t.conn.Close()
-	log.Infof("target %s removed", target)
+	log.Printf("target %s removed", target)
 	return nil
 }
 
@@ -413,7 +496,7 @@ func (c *collector) addTarget(ctx context.Context, name string, target *tunnTarg
 	defer c.mu.Unlock()
 
 	if _, ok := c.tActive[name]; ok {
-		log.Infof("trying to add target %q:%+v, but already in exists. do nothing", name, target)
+		log.Printf("trying to add target %q:%+v, but already in exists. do nothing", name, target)
 		return nil
 	}
 
@@ -423,12 +506,15 @@ func (c *collector) addTarget(ctx context.Context, name string, target *tunnTarg
 	}
 
 	c.tActive[name] = target
-	log.Infof("Added target: %q:%+v", name, target)
+	log.Printf("Added target: %q:%+v", name, target)
 	return nil
 }
 
 func main() {
 	// Flag initialization.
 	flag.Parse()
-	log.Exit(runCollector(context.Background()))
+	log.SetOutput(os.Stdout)
+	if err := runCollector(context.Background()); err != nil {
+		log.Print(err)
+	}
 }
